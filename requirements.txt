@@ -1,0 +1,7 @@
+lightgbm
+netCDF4
+numpy
+pandas
+rasterio
+scikit-learn
+xarray
