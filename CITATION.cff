@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this dataset or code, please cite the dataset record and associated article."
+title: "China 1 km Monthly Multi-timescale SPEI Dataset over Mainland China (1979-2018)"
+type: dataset
+version: 2.0.0
+date-released: 2026-09-30
+doi: 10.57760/sciencedb.34500
+url: "https://doi.org/10.57760/sciencedb.34500"
+repository-code: "https://github.com/Scorpional/China-mainland-1km-SPEI-dataset-construct"
+authors:
+  - family-names: Peng
+    given-names: Haoxiang
+  - family-names: Li
+    given-names: Wenxing
+  - family-names: Zhang
+    given-names: Kun
+  - family-names: Wu
+    given-names: Chengrong
+  - family-names: Liu
+    given-names: Hui
+  - family-names: Chu
+    given-names: Yihang
+  - family-names: Chen
+    given-names: Xidong

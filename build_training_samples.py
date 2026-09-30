@@ -18,18 +18,34 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_lagged_features(df: pd.DataFrame, numeric_cols: list[str], scale: int, max_lag: int) -> pd.DataFrame:
+def add_lagged_features(
+    df: pd.DataFrame,
+    numeric_cols: list[str],
+    scale: int,
+    max_lag: int,
+) -> tuple[pd.DataFrame, list[str]]:
     df = df.sort_values(["station_id", "year", "month"]).copy()
     groups = df.groupby("station_id", group_keys=False)
+    history_columns: list[str] = []
 
     for col in numeric_cols:
         for lag in range(1, max_lag + 1):
-            df[f"{col}_lag{lag}"] = groups[col].shift(lag)
-        df[f"{col}_roll{scale}_mean"] = groups[col].transform(lambda s: s.rolling(scale, min_periods=1).mean())
+            name = f"{col}_lag{lag}"
+            df[name] = groups[col].shift(lag)
+            history_columns.append(name)
+        mean_name = f"{col}_roll{scale}_mean"
+        df[mean_name] = groups[col].transform(
+            lambda series: series.rolling(scale, min_periods=scale).mean()
+        )
+        history_columns.append(mean_name)
         if "prec" in col.lower() or col.lower() == "pr":
-            df[f"{col}_roll{scale}_sum"] = groups[col].transform(lambda s: s.rolling(scale, min_periods=1).sum())
+            sum_name = f"{col}_roll{scale}_sum"
+            df[sum_name] = groups[col].transform(
+                lambda series: series.rolling(scale, min_periods=scale).sum()
+            )
+            history_columns.append(sum_name)
 
-    return df
+    return df, history_columns
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,9 +99,11 @@ def main() -> None:
         time_varying_cols.extend(extra_numeric)
 
     df = add_calendar_features(df)
-    max_lag = args.max_lag if args.max_lag is not None else max(1, args.scale - 1)
-    df = add_lagged_features(df, sorted(set(time_varying_cols)), args.scale, max_lag)
-    df = df.dropna(subset=["spei"]).reset_index(drop=True)
+    max_lag = args.max_lag if args.max_lag is not None else max(0, args.scale - 1)
+    df, history_columns = add_lagged_features(
+        df, sorted(set(time_varying_cols)), args.scale, max_lag
+    )
+    df = df.dropna(subset=["spei", *history_columns]).reset_index(drop=True)
 
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.output_csv, index=False)

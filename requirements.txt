@@ -1,7 +1,11 @@
+gdal
 lightgbm
+matplotlib
 netCDF4
 numpy
 pandas
 rasterio
+remotezip
 scikit-learn
+scipy
 xarray

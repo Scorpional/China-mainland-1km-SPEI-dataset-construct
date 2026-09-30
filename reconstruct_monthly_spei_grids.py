@@ -10,275 +10,341 @@ from lightgbm import LGBMRegressor
 from netCDF4 import Dataset
 from rasterio.windows import Window
 from rasterio.warp import transform
+from scipy.ndimage import distance_transform_edt
 from sklearn.impute import SimpleImputer
 
+from cmfd_monthly_units import convert_cmfd_monthly_values
+from cmfd_spatial_sampling import prepare_regular_grid_sampling, sample_regular_grid
+from model_config import MODEL_PARAMS, select_production_features
 
-ROOT = Path(r"D:\GitRepository\bte")
-CMFD_DIR = ROOT / "data_downloads" / "cmfd" / "Data_forcing_01mo_010deg"
-STATIC_DIR = ROOT / "derived_data" / "grid_1km_china" / "static"
-TRAIN_DIR = ROOT / "derived_data" / "training_samples"
-CACHE_DIR = ROOT / "derived_data" / "cache" / "cmfd_climatology"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-CMFD_FILES = {
-    "lrad": CMFD_DIR / "lrad_CMFD_V0106_B-01_01mo_010deg_197901-201812.nc",
-    "prec": CMFD_DIR / "prec_CMFD_V0106_B-01_01mo_010deg_197901-201812.nc",
-    "pres": CMFD_DIR / "pres_CMFD_V0106_B-01_01mo_010deg_197901-201812.nc",
-    "shum": CMFD_DIR / "shum_CMFD_V0106_B-01_01mo_010deg_197901-201812.nc",
-    "srad": CMFD_DIR / "srad_CMFD_V0106_B-01_01mo_010deg_197901-201812.nc",
-    "temp": CMFD_DIR / "temp_CMFD_V0106_B-01_01mo_010deg_197901-201812.nc",
-    "wind": CMFD_DIR / "wind_CMFD_V0106_B-01_01mo_010deg_197901-201812.nc",
+CMFD_VARIABLES = ("lrad", "prec", "pres", "shum", "srad", "temp", "wind")
+TERRAIN_FILES = {
+    "dem_elev_m": "dem_elev_m.tif",
+    "dem_relief_1km": "dem_relief_1km.tif",
+    "dem_std_1km": "dem_std_1km.tif",
 }
-
-TRAINING_TABLES = {
-    1: TRAIN_DIR / "spei01_demsoil_nomodis_anomaly_training_samples_1979-2018.csv",
-    3: TRAIN_DIR / "spei03_demsoil_nomodis_anomaly_training_samples_1979-2018.csv",
-    6: TRAIN_DIR / "spei06_demsoil_nomodis_anomaly_training_samples_1979-2018.csv",
-    12: TRAIN_DIR / "spei12_demsoil_nomodis_anomaly_training_samples_1979-2018.csv",
-    24: TRAIN_DIR / "spei24_demsoil_nomodis_anomaly_training_samples_1979-2018.csv",
-}
-
-MODEL_PARAMS = {
-    "n_estimators": 800,
-    "learning_rate": 0.03,
-    "num_leaves": 63,
-    "min_child_samples": 30,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "reg_lambda": 0.5,
-    "random_state": 42,
-    "n_jobs": 1,
-    "verbose": -1,
-}
-
-STATIC_RASTERS = {
-    "dem_elev_m": STATIC_DIR / "dem_elev_m.tif",
-    "dem_relief_1km": STATIC_DIR / "dem_relief_1km.tif",
-    "dem_std_1km": STATIC_DIR / "dem_std_1km.tif",
-    "soil_bdod_0_5cm": STATIC_DIR / "soil_bdod_0_5cm.tif",
-    "soil_clay_0_5cm": STATIC_DIR / "soil_clay_0_5cm.tif",
-    "soil_phh2o_0_5cm": STATIC_DIR / "soil_phh2o_0_5cm.tif",
-    "soil_sand_0_5cm": STATIC_DIR / "soil_sand_0_5cm.tif",
-    "soil_silt_0_5cm": STATIC_DIR / "soil_silt_0_5cm.tif",
-    "soil_soc_0_5cm": STATIC_DIR / "soil_soc_0_5cm.tif",
-}
+LAND_MASK_FILE = "china_land_mask_1km.tif"
+CMFD_TIMES = pd.date_range("1979-01-01", periods=480, freq="MS")
 
 
-def parse_month(month_text: str) -> pd.Timestamp:
-    return pd.Timestamp(f"{month_text}-01")
+def resolve_cmfd_files(cmfd_dir: Path) -> dict[str, Path]:
+    output: dict[str, Path] = {}
+    for variable in CMFD_VARIABLES:
+        matches = sorted(cmfd_dir.glob(f"{variable}_*.nc"))
+        if len(matches) != 1:
+            raise FileNotFoundError(
+                f"Expected one NetCDF for {variable} in {cmfd_dir}, found {matches}"
+            )
+        output[variable] = matches[0]
+    return output
 
 
-def fit_model(scale: int) -> tuple[LGBMRegressor, SimpleImputer, list[str]]:
-    df = pd.read_csv(TRAINING_TABLES[scale])
-    feature_cols = [
-        col
-        for col in df.columns
-        if col not in {"spei", "scale", "station_id", "month_end_date", "time"} and pd.api.types.is_numeric_dtype(df[col])
-    ]
+def fit_model(training_csv: Path) -> tuple[LGBMRegressor, SimpleImputer, list[str]]:
+    frame = pd.read_csv(training_csv, dtype={"station_id": str})
+    if "spei" not in frame:
+        raise ValueError(f"Missing target column 'spei' in {training_csv}")
+    feature_columns = select_production_features(frame)
     imputer = SimpleImputer(strategy="median")
-    x_train = imputer.fit_transform(df[feature_cols])
-    y_train = df["spei"].to_numpy()
+    predictors = imputer.fit_transform(frame[feature_columns])
     model = LGBMRegressor(**MODEL_PARAMS)
-    model.fit(x_train, y_train)
-    return model, imputer, feature_cols
+    model.fit(predictors, frame["spei"].to_numpy())
+    return model, imputer, feature_columns
 
 
-def open_cmfd() -> tuple[dict[str, Dataset], np.ndarray, np.ndarray, pd.DatetimeIndex]:
-    datasets = {name: Dataset(path) for name, path in CMFD_FILES.items()}
-    lons = datasets["prec"].variables["lon"][:].astype("float32")
-    lats = datasets["prec"].variables["lat"][:].astype("float32")
-    times = pd.date_range("1979-01-01", periods=480, freq="MS")
-    return datasets, lons, lats, times
+def open_cmfd(files: dict[str, Path]) -> tuple[dict[str, Dataset], np.ndarray, np.ndarray]:
+    datasets = {name: Dataset(path) for name, path in files.items()}
+    lons = np.asarray(datasets["prec"].variables["lon"][:], dtype=np.float32)
+    lats = np.asarray(datasets["prec"].variables["lat"][:], dtype=np.float32)
+    for name, dataset in datasets.items():
+        if dataset.variables[name].shape[0] != len(CMFD_TIMES):
+            raise ValueError(f"Unexpected CMFD time dimension for {name}")
+    return datasets, lons, lats
 
 
-def rolling_sum(arr: np.ndarray, window: int) -> np.ndarray:
-    cumsum = np.cumsum(arr, axis=0, dtype=np.float32)
-    out = np.empty_like(arr, dtype=np.float32)
-    out[: window - 1] = np.nan
-    out[window - 1] = cumsum[window - 1]
-    out[window:] = cumsum[window:] - cumsum[:-window]
-    return out
+def rolling_sum(array: np.ndarray, window: int) -> np.ndarray:
+    cumulative = np.cumsum(array, axis=0, dtype=np.float32)
+    output = np.empty_like(array, dtype=np.float32)
+    output[: window - 1] = np.nan
+    output[window - 1] = cumulative[window - 1]
+    output[window:] = cumulative[window:] - cumulative[:-window]
+    return output
 
 
-def load_climatology(scale: int, var_name: str) -> dict[str, np.ndarray]:
-    cache_path = CACHE_DIR / f"scale_{scale:02d}_{var_name}_climatology.npz"
-    if cache_path.exists():
-        obj = np.load(cache_path)
-        return {key: obj[key] for key in obj.files}
+def load_climatology(
+    scale: int,
+    variable: str,
+    cmfd_file: Path,
+    cache_dir: Path,
+) -> dict[str, np.ndarray]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = cache_dir / f"scale_{scale:02d}_{variable}_climatology.npz"
+    if cache.exists():
+        stored = np.load(cache)
+        return {name: stored[name] for name in stored.files}
 
-    with Dataset(CMFD_FILES[var_name]) as ds:
-        arr = ds.variables[var_name][:].astype("float32")
-
-    current = np.stack([np.nanmean(arr[month::12], axis=0) for month in range(12)], axis=0).astype("float32")
-    rolling_mean = rolling_sum(arr, scale) / float(scale)
-    rolling_mean_clim = np.stack(
+    with Dataset(cmfd_file) as dataset:
+        values = convert_cmfd_monthly_values(
+            variable, dataset.variables[variable][:], CMFD_TIMES
+        )
+    current = np.stack(
+        [np.nanmean(values[month::12], axis=0) for month in range(12)], axis=0
+    ).astype(np.float32)
+    rolling = rolling_sum(values, scale)
+    rolling_mean = rolling / float(scale)
+    rolling_mean_climatology = np.stack(
         [
             np.nanmean(
-                rolling_mean[np.array([idx for idx in range(month, arr.shape[0], 12) if idx >= scale - 1])],
+                rolling_mean[
+                    np.asarray(
+                        [index for index in range(month, len(CMFD_TIMES), 12) if index >= scale - 1]
+                    )
+                ],
                 axis=0,
             )
             for month in range(12)
         ],
         axis=0,
-    ).astype("float32")
-
-    payload = {"current": current, "roll_mean": rolling_mean_clim}
-    if var_name == "prec":
-        rolling_prec_sum = rolling_sum(arr, scale)
-        rolling_sum_clim = np.stack(
+    ).astype(np.float32)
+    payload = {"current": current, "roll_mean": rolling_mean_climatology}
+    if variable == "prec":
+        payload["roll_sum"] = np.stack(
             [
                 np.nanmean(
-                    rolling_prec_sum[np.array([idx for idx in range(month, arr.shape[0], 12) if idx >= scale - 1])],
+                    rolling[
+                        np.asarray(
+                            [index for index in range(month, len(CMFD_TIMES), 12) if index >= scale - 1]
+                        )
+                    ],
                     axis=0,
                 )
                 for month in range(12)
             ],
             axis=0,
-        ).astype("float32")
-        payload["roll_sum"] = rolling_sum_clim
-
-    np.savez_compressed(cache_path, **payload)
+        ).astype(np.float32)
+    np.savez_compressed(cache, **payload)
     return payload
 
 
-def get_dynamic_arrays(
+def month_arrays(
     datasets: dict[str, Dataset],
     time_index: int,
     scale: int,
     climatology: dict[str, dict[str, np.ndarray]],
 ) -> dict[str, np.ndarray]:
     month_index = time_index % 12
-    data: dict[str, np.ndarray] = {}
-    for var_name, ds in datasets.items():
-        var = ds.variables[var_name]
-        current = var[time_index].astype("float32")
-        data[f"dyn_{var_name}"] = current
-        data[f"clim_dyn_{var_name}"] = climatology[var_name]["current"][month_index]
-        data[f"anom_dyn_{var_name}"] = current - data[f"clim_dyn_{var_name}"]
+    output: dict[str, np.ndarray] = {}
+    for variable, dataset in datasets.items():
+        source = dataset.variables[variable]
+        current = convert_cmfd_monthly_values(
+            variable, source[time_index], CMFD_TIMES[time_index]
+        )
+        output[f"dyn_{variable}"] = current
+        output[f"clim_dyn_{variable}"] = climatology[variable]["current"][month_index]
+        output[f"anom_dyn_{variable}"] = current - output[f"clim_dyn_{variable}"]
 
         for lag in range(1, scale):
-            data[f"dyn_{var_name}_lag{lag}"] = var[time_index - lag].astype("float32")
+            output[f"dyn_{variable}_lag{lag}"] = convert_cmfd_monthly_values(
+                variable,
+                source[time_index - lag],
+                CMFD_TIMES[time_index - lag],
+            )
 
-        window_arr = var[time_index - scale + 1 : time_index + 1].astype("float32")
-        rolling_mean = window_arr.mean(axis=0).astype("float32")
-        data[f"dyn_{var_name}_roll{scale}_mean"] = rolling_mean
-        data[f"clim_dyn_{var_name}_roll{scale}_mean"] = climatology[var_name]["roll_mean"][month_index]
-        data[f"anom_dyn_{var_name}_roll{scale}_mean"] = rolling_mean - data[f"clim_dyn_{var_name}_roll{scale}_mean"]
+        window = convert_cmfd_monthly_values(
+            variable,
+            source[time_index - scale + 1 : time_index + 1],
+            CMFD_TIMES[time_index - scale + 1 : time_index + 1],
+        )
+        rolling_mean = window.mean(axis=0).astype(np.float32)
+        mean_name = f"dyn_{variable}_roll{scale}_mean"
+        output[mean_name] = rolling_mean
+        output[f"clim_{mean_name}"] = climatology[variable]["roll_mean"][month_index]
+        output[f"anom_{mean_name}"] = rolling_mean - output[f"clim_{mean_name}"]
+        if variable == "prec":
+            rolling_total = window.sum(axis=0).astype(np.float32)
+            sum_name = f"dyn_{variable}_roll{scale}_sum"
+            output[sum_name] = rolling_total
+            output[f"clim_{sum_name}"] = climatology[variable]["roll_sum"][month_index]
+            output[f"anom_{sum_name}"] = rolling_total - output[f"clim_{sum_name}"]
+    return output
 
-        if var_name == "prec":
-            rolling_sum_arr = window_arr.sum(axis=0).astype("float32")
-            data[f"dyn_{var_name}_roll{scale}_sum"] = rolling_sum_arr
-            data[f"clim_dyn_{var_name}_roll{scale}_sum"] = climatology[var_name]["roll_sum"][month_index]
-            data[f"anom_dyn_{var_name}_roll{scale}_sum"] = rolling_sum_arr - data[f"clim_dyn_{var_name}_roll{scale}_sum"]
 
-    return data
+def nearest_valid_grid(array: np.ndarray) -> np.ndarray:
+    values = np.ma.filled(np.ma.asarray(array, dtype=np.float32), np.nan)
+    valid = np.isfinite(values)
+    if valid.all() or not valid.any():
+        return values
+    indices = distance_transform_edt(~valid, return_distances=False, return_indices=True)
+    return values[tuple(indices)]
 
 
-def block_lon_lat(src: rasterio.DatasetReader, row0: int, row1: int) -> tuple[np.ndarray, np.ndarray]:
-    rows = np.arange(row0, row1)
-    cols = np.arange(src.width)
-    xs = src.transform.c + (cols + 0.5) * src.transform.a
-    ys = src.transform.f + (rows + 0.5) * src.transform.e
+def block_coordinates(
+    reference: rasterio.DatasetReader,
+    row_start: int,
+    row_stop: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    rows = np.arange(row_start, row_stop)
+    columns = np.arange(reference.width)
+    xs = reference.transform.c + (columns + 0.5) * reference.transform.a
+    ys = reference.transform.f + (rows + 0.5) * reference.transform.e
     xx, yy = np.meshgrid(xs, ys)
-    lon, lat = transform(src.crs, "EPSG:4326", xx.ravel().tolist(), yy.ravel().tolist())
-    return np.asarray(lon, dtype="float32").reshape(xx.shape), np.asarray(lat, dtype="float32").reshape(xx.shape)
+    lon, lat = transform(
+        reference.crs, "EPSG:4326", xx.ravel().tolist(), yy.ravel().tolist()
+    )
+    shape = xx.shape
+    return np.asarray(lon, dtype=np.float32).reshape(shape), np.asarray(lat, dtype=np.float32).reshape(shape)
+
+
+def assert_alignment(handles: dict[str, rasterio.DatasetReader]) -> None:
+    items = list(handles.items())
+    reference_name, reference = items[0]
+    geometry = (reference.width, reference.height, reference.crs, reference.transform)
+    for name, source in items[1:]:
+        if (source.width, source.height, source.crs, source.transform) != geometry:
+            raise ValueError(f"Raster {name} is not aligned with {reference_name}")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the final LightGBM model and reconstruct 1 km monthly SPEI grids.")
+    parser = argparse.ArgumentParser(
+        description="Fit the final no-soil LightGBM model and reconstruct monthly 1 km SPEI grids."
+    )
+    parser.add_argument("training_csv", type=Path)
+    parser.add_argument("cmfd_dir", type=Path)
+    parser.add_argument("static_dir", type=Path)
+    parser.add_argument("cache_dir", type=Path)
+    parser.add_argument("out_dir", type=Path)
     parser.add_argument("--scale", type=int, required=True, choices=[1, 3, 6, 12, 24])
-    parser.add_argument("--start", required=True, help="Start month in YYYY-MM")
-    parser.add_argument("--end", required=True, help="End month in YYYY-MM")
-    parser.add_argument("--out-dir", type=Path, required=True, help="Output raster directory")
-    parser.add_argument("--row-chunk", type=int, default=64, help="Row block size for tiled prediction")
+    parser.add_argument("--start", required=True, help="First requested month, YYYY-MM")
+    parser.add_argument("--end", required=True, help="Last requested month, YYYY-MM")
+    parser.add_argument("--row-chunk", type=int, default=64)
+    parser.add_argument("--prediction-threads", type=int, default=1)
+    parser.add_argument("--skip-existing", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    model, imputer, feature_cols = fit_model(args.scale)
-    datasets, cmfd_lons, cmfd_lats, times = open_cmfd()
-    climatology = {name: load_climatology(args.scale, name) for name in CMFD_FILES}
-    start_month = parse_month(args.start)
-    end_month = parse_month(args.end)
-    target_times = [ts for ts in times if start_month <= ts <= end_month and ts >= times[args.scale - 1]]
+    model, imputer, feature_columns = fit_model(args.training_csv)
+    if any(name.startswith("soil_") for name in feature_columns):
+        raise AssertionError("Soil predictors must not enter the version 2 production model")
 
+    cmfd_files = resolve_cmfd_files(args.cmfd_dir)
+    datasets, cmfd_lons, cmfd_lats = open_cmfd(cmfd_files)
+    climatology = {
+        variable: load_climatology(
+            args.scale, variable, cmfd_files[variable], args.cache_dir
+        )
+        for variable in CMFD_VARIABLES
+    }
+
+    terrain_paths = {
+        name: args.static_dir / filename for name, filename in TERRAIN_FILES.items()
+    }
+    mask_path = args.static_dir / LAND_MASK_FILE
+    missing = [str(path) for path in [*terrain_paths.values(), mask_path] if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing canonical 1 km rasters: {missing}")
+    terrain = {name: rasterio.open(path) for name, path in terrain_paths.items()}
+    mask = rasterio.open(mask_path)
+    assert_alignment({**terrain, "land_mask": mask})
+
+    start = pd.Timestamp(f"{args.start}-01")
+    end = pd.Timestamp(f"{args.end}-01")
+    target_times = [
+        timestamp
+        for timestamp in CMFD_TIMES
+        if start <= timestamp <= end and timestamp >= CMFD_TIMES[args.scale - 1]
+    ]
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    static_handles = {name: rasterio.open(path) for name, path in STATIC_RASTERS.items()}
-    ref = static_handles["soil_clay_0_5cm"]
-
-    lon0 = float(cmfd_lons[0])
-    lat0 = float(cmfd_lats[0])
-    step_lon = float(cmfd_lons[1] - cmfd_lons[0])
-    step_lat = float(cmfd_lats[1] - cmfd_lats[0])
-
-    meta = ref.meta.copy()
-    meta.update(dtype="float32", count=1, nodata=-9999.0, compress="lzw", tiled=True)
+    metadata = mask.meta.copy()
+    metadata.update(dtype="float32", count=1, nodata=-9999.0, compress="lzw", tiled=True)
 
     try:
-        for ts in target_times:
-            time_index = int(np.where(times == ts)[0][0])
-            dynamic_arrays = get_dynamic_arrays(datasets, time_index, args.scale, climatology)
-            out_path = args.out_dir / f"spei_{args.scale:02d}mo_{ts.strftime('%Y-%m')}.tif"
-            with rasterio.open(out_path, "w", **meta) as dst:
-                for row0 in range(0, ref.height, args.row_chunk):
-                    row1 = min(row0 + args.row_chunk, ref.height)
-                    window = Window(0, row0, ref.width, row1 - row0)
+        for timestamp in target_times:
+            output_path = args.out_dir / f"spei_{args.scale:02d}mo_{timestamp:%Y-%m}.tif"
+            if output_path.exists():
+                if not args.skip_existing:
+                    raise FileExistsError(f"Refusing to overwrite {output_path}")
+                with rasterio.open(output_path) as existing:
+                    if existing.tags().get("generation_complete") == "true":
+                        print(f"Skipped {output_path}", flush=True)
+                        continue
+                raise RuntimeError(f"Existing raster is not marked complete: {output_path}")
 
-                    static_block: dict[str, np.ndarray] = {}
-                    for name, src in static_handles.items():
-                        arr = src.read(1, window=window).astype("float32")
-                        arr[np.isclose(arr, src.nodata)] = np.nan
-                        static_block[name] = arr
+            time_index = int(np.where(CMFD_TIMES == timestamp)[0][0])
+            dynamic = month_arrays(
+                datasets, time_index, args.scale, climatology
+            )
+            dynamic_fallback = {
+                name: nearest_valid_grid(values) for name, values in dynamic.items()
+            }
 
-                    valid_mask = np.isfinite(static_block["soil_clay_0_5cm"])
-                    out_arr = np.full((row1 - row0, ref.width), -9999.0, dtype="float32")
-                    if not valid_mask.any():
-                        dst.write(out_arr, 1, window=window)
+            with rasterio.open(output_path, "w", **metadata) as destination:
+                for row_start in range(0, mask.height, args.row_chunk):
+                    row_stop = min(row_start + args.row_chunk, mask.height)
+                    window = Window(0, row_start, mask.width, row_stop - row_start)
+                    valid = mask.read(1, window=window) == 1
+                    output = np.full(valid.shape, -9999.0, dtype=np.float32)
+                    if not valid.any():
+                        destination.write(output, 1, window=window)
                         continue
 
-                    lon, lat = block_lon_lat(ref, row0, row1)
-                    lon_idx = np.clip(np.rint((lon - lon0) / step_lon).astype(int), 0, len(cmfd_lons) - 1)
-                    lat_idx = np.clip(np.rint((lat - lat0) / step_lat).astype(int), 0, len(cmfd_lats) - 1)
-
-                    features: dict[str, np.ndarray] = {}
-                    features["year"] = np.full(valid_mask.sum(), ts.year, dtype="float32")
-                    features["month"] = np.full(valid_mask.sum(), ts.month, dtype="float32")
-                    features["month_sin"] = np.full(valid_mask.sum(), np.sin(2 * np.pi * ts.month / 12.0), dtype="float32")
-                    features["month_cos"] = np.full(valid_mask.sum(), np.cos(2 * np.pi * ts.month / 12.0), dtype="float32")
-                    features["lat"] = lat[valid_mask]
-                    features["lon"] = lon[valid_mask]
-                    features["station_lat"] = lat[valid_mask]
-                    features["station_lon"] = lon[valid_mask]
-                    features["cmfd_grid_lon"] = cmfd_lons[lon_idx[valid_mask]]
-                    features["cmfd_grid_lat"] = cmfd_lats[lat_idx[valid_mask]]
-
-                    elevation = static_block["dem_elev_m"][valid_mask]
-                    features["Elevation(m)"] = elevation
-                    features["station_elevation_m"] = elevation
-
-                    for name, arr in static_block.items():
-                        features[name] = arr[valid_mask]
-                    for name, arr in dynamic_arrays.items():
-                        features[name] = arr[lat_idx[valid_mask], lon_idx[valid_mask]]
-
-                    frame = pd.DataFrame(
-                        {
-                            col: features.get(col, np.full(valid_mask.sum(), np.nan, dtype="float32"))
-                            for col in feature_cols
-                        }
+                    lon, lat = block_coordinates(mask, row_start, row_stop)
+                    sample_lon = lon[valid]
+                    sample_lat = lat[valid]
+                    sampling_plan = prepare_regular_grid_sampling(
+                        sample_lon, sample_lat, cmfd_lons, cmfd_lats
                     )
-                    x_pred = pd.DataFrame(imputer.transform(frame), columns=feature_cols)
-                    pred = model.predict(x_pred).astype("float32")
-                    out_arr[valid_mask] = pred
-                    dst.write(out_arr, 1, window=window)
+                    features: dict[str, np.ndarray] = {
+                        "year": np.full(valid.sum(), timestamp.year, dtype=np.float32),
+                        "month": np.full(valid.sum(), timestamp.month, dtype=np.float32),
+                        "month_sin": np.full(valid.sum(), np.sin(2 * np.pi * timestamp.month / 12.0), dtype=np.float32),
+                        "month_cos": np.full(valid.sum(), np.cos(2 * np.pi * timestamp.month / 12.0), dtype=np.float32),
+                        "lon": sample_lon,
+                        "lat": sample_lat,
+                    }
+                    for name, source in terrain.items():
+                        array = source.read(1, window=window).astype(np.float32)
+                        if source.nodata is not None:
+                            array[np.isclose(array, source.nodata)] = np.nan
+                        features[name] = array[valid]
+                    for name, values in dynamic.items():
+                        features[name] = sample_regular_grid(
+                            values,
+                            sample_lon,
+                            sample_lat,
+                            cmfd_lons,
+                            cmfd_lats,
+                            fallback_array=dynamic_fallback[name],
+                            sampling_plan=sampling_plan,
+                        )
 
-            print(f"Wrote {out_path}")
+                    missing_features = [name for name in feature_columns if name not in features]
+                    if missing_features:
+                        raise KeyError(f"Inference is missing training features: {missing_features}")
+                    frame = pd.DataFrame({name: features[name] for name in feature_columns})
+                    predictors = imputer.transform(frame)
+                    prediction = model.predict(
+                        predictors, num_threads=args.prediction_threads
+                    ).astype(np.float32)
+                    output[valid] = prediction
+                    destination.write(output, 1, window=window)
+                destination.update_tags(
+                    generation_complete="true",
+                    product_version="2",
+                    model="LightGBM_Leaf63",
+                    cmfd_spatial_method="bilinear",
+                    soil_predictors="excluded",
+                    spei_timescale_months=str(args.scale),
+                    year_month=timestamp.strftime("%Y-%m"),
+                )
+            print(f"Wrote {output_path}", flush=True)
     finally:
-        for ds in datasets.values():
-            ds.close()
-        for src in static_handles.values():
-            src.close()
+        for dataset in datasets.values():
+            dataset.close()
+        for source in terrain.values():
+            source.close()
+        mask.close()
 
 
 if __name__ == "__main__":
